@@ -22,11 +22,20 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Models are tried in order. If one is unavailable the next one is used.
-MODEL_OPTIONS = [
+# Preferred models, best first. The app asks Groq which models your key can
+# really use and ranks them with this list, so retired models never break it.
+PREFERRED_MODELS = [
     "llama-3.3-70b-versatile",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "qwen/qwen3-32b",
     "llama-3.1-8b-instant",
 ]
+# Used only if Groq's model list cannot be fetched.
+FALLBACK_MODELS = ["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+# Model ids containing these words are not chat models.
+NON_CHAT_KEYWORDS = ("whisper", "tts", "playai", "orpheus", "guard", "embed", "safeguard")
 MAX_NOTES_CHARS = 12000
 MIN_NOTES_CHARS = 40
 
@@ -338,9 +347,33 @@ def validate_payload(data: dict, want_mcq: int, want_cards: int):
     return topic, mcqs[:want_mcq] if want_mcq else [], cards[:want_cards] if want_cards else []
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def _fetch_model_ids(api_key: str) -> list:
+    client = Groq(api_key=api_key, timeout=20.0)
+    ids = [m.id for m in client.models.list().data]
+    chat_ids = [i for i in ids if not any(k in i.lower() for k in NON_CHAT_KEYWORDS)]
+
+    def rank(model_id: str) -> int:
+        return PREFERRED_MODELS.index(model_id) if model_id in PREFERRED_MODELS else len(PREFERRED_MODELS)
+
+    return sorted(chat_ids, key=rank)
+
+
+def get_available_models(api_key: str) -> list:
+    """Chat models your Groq key can use, best first. Never raises."""
+    if not api_key:
+        return list(FALLBACK_MODELS)
+    try:
+        models = _fetch_model_ids(api_key)
+        return models or list(FALLBACK_MODELS)
+    except Exception:
+        return list(FALLBACK_MODELS)
+
+
 def parse_json_loose(text: str) -> dict:
     """Parse JSON even if the model wrapped it in markdown fences."""
     text = (text or "").strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
     try:
         return json.loads(text)
@@ -356,6 +389,8 @@ def friendly_error(exc: Exception) -> str:
     low = msg.lower()
     if "401" in low or "invalid api key" in low or "authentication" in low:
         return "Your Groq API key looks invalid. Please check it in the sidebar."
+    if "model_not_found" in low or "does not exist" in low:
+        return "None of the available AI models worked for your key. Pick a different model in the sidebar."
     if "429" in low or "rate limit" in low:
         return "Groq rate limit reached. Please wait a moment and try again."
     if "connection" in low or "timeout" in low or "timed out" in low:
@@ -368,7 +403,7 @@ def generate_material(api_key: str, model: str, notes: str, difficulty: str, n_m
     client = Groq(api_key=api_key, timeout=60.0)
     prompt = build_prompt(notes, difficulty, n_mcq, n_cards)
 
-    models_to_try = [model] + [m for m in MODEL_OPTIONS if m != model]
+    models_to_try = [model] + [m for m in get_available_models(api_key) if m != model][:4]
     last_error = None
 
     for current_model in models_to_try:
@@ -422,7 +457,13 @@ with st.sidebar:
         placeholder="gsk_...",
         help="Or set GROQ_API_KEY as an environment variable / Streamlit secret.",
     )
-    model = st.selectbox("AI model", MODEL_OPTIONS, index=0)
+    _key_now = resolve_api_key(typed_key)
+    model = st.selectbox(
+        "AI model",
+        get_available_models(_key_now),
+        index=0,
+        help="The list is loaded from Groq for your API key.",
+    )
     difficulty = st.select_slider("Difficulty", options=["Easy", "Medium", "Hard"], value="Medium")
     output_mode = st.radio("What to create?", ["Quiz + Flashcards", "Quiz only", "Flashcards only"])
 
@@ -520,7 +561,7 @@ if mcqs or cards:
                         st.markdown(
                             f'<div class="q-card"><div class="q-num">QUESTION {i + 1} OF {len(mcqs)}</div>'
                             f'<div class="q-text">{q["question"]}</div></div>',
-                            unsafe_allow_html=False if False else True,
+                            unsafe_allow_html=True,
                         )
                         st.radio(
                             f"Answer for question {i + 1}",
